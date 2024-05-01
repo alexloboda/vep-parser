@@ -22,11 +22,16 @@ class VepParser:
         vcf_fields = line.split("\t")
         variant = vcf_fields[0:7]
         variant_dict = dict((self.vcf_fields[i], variant[i]) for i in range(len(variant)))
+        print(vcf_fields)
         info = vcf_fields[7]
         if info == ".":
             return
         vep = re.split("[|,]", info)
-        assert len(vep) % len(self.fields) == 0
+        if len(vep) % len(self.fields) != 0:
+            print("Could not parse the line: ")
+            print(line)
+            print("VEP entry length - %d while the arg states %d" % (len(vep), len(self.fields)))
+            exit(1)
         n_entries = len(vep) // len(self.fields)
         for i in range(n_entries):
             transcript = vep[i * len(self.fields):(i + 1) * len(self.fields)]
@@ -74,7 +79,7 @@ class Annotator(VepParser):
     def process_annotation(self, annotation, variant):
         # vcf_format = "CHROM|POS|ID|REF|ALT|QUAL|FILTER|INFO"
         line = variant['CHROM'] + "\t" + variant['POS'] + "\t" + variant['REF'] + "\t" + variant['ALT'] +\
-            "\t" + annotation['Consequence'] + "\t" + annotation['SYMBOL'] 
+            "\t" + annotation['Consequence'] + "\t" + annotation['SYMBOL']
         if line not in self.lines:
             self.lines.add(line)
             self.fd.write(line + "\n")

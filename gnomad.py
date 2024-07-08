@@ -1,6 +1,6 @@
 import sys
 
-# wget -qO- https://storage.googleapis.com/gcp-public-data--gnomad/release/2.1.1/vcf/exomes/gnomad.exomes.r2.1.1.sites.vcf.bgz | zcat | buffer -m 100M -s 100k |  python3 a.py list_of_variants.tsv > tbl.out
+# wget -qO- https://storage.googleapis.com/gcp-public-data--gnomad/release/2.1.1/vcf/exomes/gnomad.exomes.r2.1.1.sites.vcf.bgz | zcat | python3 a.py list_of_variants.tsv > tbl.out
 
 variants = set()
 populations = ["afr",

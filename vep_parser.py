@@ -5,33 +5,55 @@ from enum import Enum
 import os
 import contextlib
 
+class VepParserError(Exception):
+    """Base exception for VEP parser errors"""
+    pass
+
+
+class VepFormatError(VepParserError):
+    """Exception raised when VEP format is incorrect"""
+    pass
+
+
+class VepParseError(VepParserError):
+    """Exception raised during line parsing"""
+    def __init__(self, message, line_number=None, line_content=None):
+        self.line_number = line_number
+        self.line_content = line_content
+        if line_number is not None:
+            message = f"Line {line_number}: {message}"
+        if line_content is not None:
+            message += f"\n  Content: {line_content[:100]}"
+        super().__init__(message)
+
+
 class VepParser:
     vcf_format = "CHROM|POS|ID|REF|ALT|QUAL|FILTER|INFO"
 
     def __init__(self, format_line = None):
         self.init = False
         self.header = ""
+        self.line_number = 0
         if format_line is not None:
+            print(format_line)
             self.fields = format_line.split("|")
             self.initialize()
         self.vcf_fields = self.vcf_format.split("|")
 
     def initialize(self):
+        """Virtual method to be overridden by subclasses if needed."""
         self.init = True
-        if self.am and 'am_pathogenicity' not in self.fields:
-            print("am_pathogenicity field not found in the VEP format")
-            exit(1)
 
     def parse_header(self, header):
         expr = re.compile("##INFO=<ID=CSQ,Number=.,Type=String,Description=\"Consequence annotations from Ensembl VEP. Format: ([^\"]+)\">")
         match = expr.search(header)
         if match is None:
-            print("Could not find the CSQ field in the header")
-            exit(1)
+            raise VepFormatError("Could not find the CSQ field in the VCF header. Make sure the file is annotated with VEP.")
         self.fields = match.group(1).split("|")
 
     def parse_file(self, fd):
         for line in fd:
+            self.line_number += 1
             if line.startswith("#"):
                 self.header += line
                 continue
@@ -39,7 +61,16 @@ class VepParser:
                 if not self.init:
                     self.parse_header(self.header)
                     self.initialize()
-                self.parse_line(line.rstrip())
+                try:
+                    self.parse_line(line.rstrip())
+                except VepParserError:
+                    raise
+                except Exception as e:
+                    raise VepParseError(
+                        f"Unexpected error during parsing: {str(e)}",
+                        line_number=self.line_number,
+                        line_content=line.rstrip()
+                    ) from e
 
     def extract_vep(self, info):
         csq = None
@@ -49,21 +80,35 @@ class VepParser:
                 csq = field[4:]
                 break
         if csq is None:
-            print("Could not find CSQ field in the INFO column")
-            exit(1)
+            raise VepParseError(
+                "Could not find CSQ field in the INFO column",
+                line_number=self.line_number
+            )
+        if not csq or csq == "":
+            # Empty CSQ field - no annotations
+            return []
         transcripts = csq.split(",")
         result = []
         for t in transcripts:
             tokens = t.split("|")
             if len(tokens) != len(self.fields):
-                print("Number of fields in CSQ does not match the number of fields in the argument")
-                print("Info field " + info)
-                exit(1)
+                raise VepParseError(
+                    f"Number of fields in CSQ ({len(tokens)}) does not match expected format ({len(self.fields)})",
+                    line_number=self.line_number,
+                    line_content=info
+                )
             result.append(dict(zip(self.fields, tokens)))
         return result
 
     def parse_line(self, line):
         vcf_fields = line.split("\t")
+        if len(vcf_fields) < 8:
+            raise VepParseError(
+                f"Invalid VCF format: expected at least 8 columns, got {len(vcf_fields)}",
+                line_number=self.line_number,
+                line_content=line
+            )
+        
         variant = vcf_fields[0:7]
         variant_dict = dict((self.vcf_fields[i], variant[i]) for i in range(len(variant)))
         info = vcf_fields[7]
@@ -71,24 +116,31 @@ class VepParser:
             return
         vep = self.extract_vep(info)
         for annotation in vep:
-            gene = annotation['SYMBOL']
-            if gene == '':
-                continue
-            if annotation['CANONICAL'] != 'YES':
-                continue
-            biotype = annotation['BIOTYPE']
-            if biotype != 'protein_coding':
-                continue
             try:
-                annotation['am_pathogenicity'] = float(annotation['am_pathogenicity'])
-            except ValueError:
-                annotation['am_pathogenicity'] = None
-            cs = annotation['Consequence'].split("&")
-            if len(cs) == 0:
-                continue
-            for cons in cs:
-                annotation['Consequence'] = cons
-                self.process_annotation(annotation, variant_dict)
+                gene = annotation.get('SYMBOL', '')
+                if gene == '':
+                    continue
+                if annotation.get('CANONICAL', '') != 'YES':
+                    continue
+                biotype = annotation.get('BIOTYPE', '')
+                if biotype != 'protein_coding':
+                    continue
+                try:
+                    annotation['am_pathogenicity'] = float(annotation['am_pathogenicity'])
+                except (ValueError, KeyError):
+                    annotation['am_pathogenicity'] = None
+                cs = annotation.get('Consequence', '').split("&")
+                if len(cs) == 0:
+                    continue
+                for cons in cs:
+                    annotation['Consequence'] = cons
+                    self.process_annotation(annotation, variant_dict)
+            except KeyError as e:
+                raise VepParseError(
+                    f"Missing expected field in VEP annotation: {str(e)}",
+                    line_number=self.line_number,
+                    line_content=line
+                ) from e
 
     def process_annotation(self, annotation: dict, variant: dict):
         raise NotImplementedError()
@@ -110,14 +162,23 @@ class UniqueValues(VepParser):
 
 class Annotator(VepParser):
     def __init__(self, output, vep_format, am):
+        self.am = am
         self.lines = set()
         super().__init__(vep_format)
-        self.am = am
-        self.fd = open(output, "w")
+
         header = "chr\tpos\tref\talt\treason\tgene"
         if am:
             header += "\tam_pathogenicity\tam_class"
+        self.fd = open(output, "w")
         self.fd.write(header + "\n")
+
+    def initialize(self):
+        super().initialize()
+        if self.am and 'am_pathogenicity' not in self.fields:
+            raise VepFormatError(
+                "am_pathogenicity field not found in the VEP format. "
+                "Make sure VEP was run with AlphaMissense plugin or remove --am flag."
+            )
 
     def process_annotation(self, annotation, variant):
         # vcf_format = "CHROM|POS|ID|REF|ALT|QUAL|FILTER|INFO"
@@ -153,12 +214,28 @@ def main():
     parser.add_argument('input')
     args = parser.parse_args()
 
-    with contextlib.closing(Annotator(args.output, args.vep, args.am)) as ann:
-        if args.input == '-':
-            ann.parse_file(sys.stdin)
-        else:
-            with open(args.input) as fd:
-                ann.parse_file(fd)
+    try:
+        with contextlib.closing(Annotator(args.output, args.vep, args.am)) as ann:
+            if args.input == '-':
+                ann.parse_file(sys.stdin)
+            else:
+                with open(args.input) as fd:
+                    ann.parse_file(fd)
+    except VepFormatError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except VepParseError as e:
+        print(f"Parse error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"Error: Input file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
+    except IOError as e:
+        print(f"Error: IO error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
